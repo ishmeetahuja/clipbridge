@@ -15,6 +15,21 @@ Mac (menu-bar app) ──encrypted──▶  ntfy server  ──encrypted──�
 
 ---
 
+## ⚡ Quick install (prebuilt)
+
+Every push to `main` builds both apps and publishes them under this repo's **Releases** (right-hand sidebar on GitHub).
+
+- **Android:** on your phone, open the latest Release, download **ClipBridge.apk**, and install it. Allow "install unknown apps" when prompted. Then follow **Pair it** below.
+- **Mac:** download **ClipBridge-mac.zip**, unzip it, drag **ClipBridge.app** into Applications, and run once in Terminal:
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/ClipBridge.app && open /Applications/ClipBridge.app
+  ```
+  The `xattr` command is needed because the app isn't notarized by Apple. Without it, macOS says the app "is damaged".
+
+If you'd rather build from source, follow the sections below.
+
+---
+
 ## 1. Mac (about 3 minutes)
 
 1. If you've never installed Apple's developer tools, open Terminal and run `xcode-select --install`.
