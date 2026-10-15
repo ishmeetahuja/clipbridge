@@ -1,0 +1,27 @@
+# Optional: self-host ntfy (e.g. on Unraid) instead of using the public https://ntfy.sh
+# Your clips are end-to-end encrypted either way; self-hosting just keeps even the
+# ciphertext on your own hardware.
+#
+#   1. Change NTFY_BASE_URL to the address your Mac AND phone will use.
+#   2. docker compose up -d
+#   3. In ClipBridge on both devices, set Server to that same URL.
+#
+# Note: if the phone must sync away from home, the server has to be reachable
+# from outside (Tailscale, Cloudflare Tunnel, or a reverse proxy with HTTPS).
+
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    command: serve
+    environment:
+      - NTFY_BASE_URL=http://192.168.1.50:8090          # <- change me
+      - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
+      - NTFY_CACHE_DURATION=12h
+      - NTFY_ATTACHMENT_CACHE_DIR=/var/cache/ntfy/attachments   # needed for clips > ~2.8 KB
+      - NTFY_ATTACHMENT_FILE_SIZE_LIMIT=5M
+    volumes:
+      - ./ntfy-cache:/var/cache/ntfy
+    ports:
+      - "8090:80"
+    restart: unless-stopped
