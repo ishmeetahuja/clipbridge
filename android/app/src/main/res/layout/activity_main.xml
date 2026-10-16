@@ -69,6 +69,13 @@
             android:layout_height="wrap_content"
             android:inputType="textCapWords" />
 
+        <CheckBox
+            android:id="@+id/saveImages"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Save images from Mac to Pictures/ClipBridge" />
+
         <Button
             android:id="@+id/btnSave"
             android:layout_width="match_parent"
@@ -98,7 +105,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Phone → Mac: select text → Share → “Send to Mac”, or add the “Send to Mac” Quick Settings tile, or tap the button in the ClipBridge notification. Mac → phone is automatic."
+            android:text="Phone → Mac: select text or an image (e.g. the Share button on a screenshot) → Share → “Send to Mac”, or copy it and tap the “Send to Mac” Quick Settings tile or the button in the ClipBridge notification. Mac → phone is automatic, including screenshots."
             android:textSize="13sp" />
     </LinearLayout>
 </ScrollView>

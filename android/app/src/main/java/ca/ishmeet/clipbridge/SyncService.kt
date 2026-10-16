@@ -15,10 +15,14 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.net.Uri
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Foreground service that keeps a streaming connection to ntfy open and writes
@@ -28,7 +32,9 @@ class SyncService : Service() {
 
     companion object {
         private const val CHANNEL = "sync"
+        private const val CHANNEL_IMAGES = "images"
         private const val NOTIF_ID = 1
+        private const val IMAGE_NOTIF_ID = 2
         private const val ACTION_RESTART = "ca.ishmeet.clipbridge.RESTART"
         private const val STALE_MS = 5 * 60 * 1000L
 
@@ -146,6 +152,11 @@ class SyncService : Service() {
         if (id.isNotEmpty()) lastId = id
 
         val att = o.optJSONObject("attachment")
+        if (att != null && att.optString("name").endsWith(".cbin") && att.optString("url").isNotEmpty()) {
+            val url = att.getString("url")
+            Thread({ handleImage(cfg, url) }, "clipbridge-image").start()
+            return
+        }
         val cipher = if (att != null && att.optString("url").isNotEmpty()) {
             try { Ntfy.download(cfg, att.getString("url")) } catch (e: Exception) { return }
         } else {
@@ -159,6 +170,58 @@ class SyncService : Service() {
             val cm = getSystemService(ClipboardManager::class.java)
             cm.setPrimaryClip(ClipData.newPlainText("From ${clip.name}", clip.text))
             setStatus("From ${clip.name}: ${preview(clip.text)}")
+        }
+    }
+
+    private fun handleImage(cfg: Cfg, url: String) {
+        val bytes = try { Ntfy.downloadBytes(cfg, url) } catch (e: Exception) { return }
+        val blob = BlobCodec.decode(cfg, bytes) ?: return
+        if (blob.from == cfg.deviceId) return
+        val fresh = System.currentTimeMillis() - blob.ts < STALE_MS
+        val stamp = SimpleDateFormat("yyyy-MM-dd 'at' HH.mm.ss", Locale.US).format(Date())
+        val gallery = if (Config.saveImages(this)) {
+            try {
+                Images.saveToGallery(this, blob.data, blob.mime, "${blob.name} $stamp.${Images.ext(blob.mime)}")
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+        if (!fresh && gallery == null) return
+        val clipUri = Images.cacheForClipboard(this, blob.data, blob.mime)
+        val kb = blob.data.size / 1024
+        if (fresh) {
+            main.post {
+                val cm = getSystemService(ClipboardManager::class.java)
+                cm.setPrimaryClip(ClipData.newUri(contentResolver, "Image from ${blob.name}", clipUri))
+                setStatus("Image from ${blob.name} ($kb KB)")
+            }
+        }
+        showImageNotification(blob, gallery ?: clipUri, fresh, gallery != null)
+    }
+
+    private fun showImageNotification(blob: ImageBlob, viewUri: Uri, copied: Boolean, saved: Boolean) {
+        val view = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(viewUri, blob.mime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pi = PendingIntent.getActivity(
+            this, 2, view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val detail = listOfNotNull(
+            if (copied) "Copied to clipboard" else null,
+            if (saved) "saved to Pictures/ClipBridge" else null,
+        ).joinToString(" · ")
+        val b = Notification.Builder(this, CHANNEL_IMAGES)
+            .setSmallIcon(R.drawable.ic_stat_clip)
+            .setContentTitle("Image from ${blob.name}")
+            .setContentText(detail.ifEmpty { "Tap to view" })
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+        Images.previewBitmap(blob.data)?.let { bmp ->
+            b.setLargeIcon(bmp).setStyle(Notification.BigPictureStyle().bigPicture(bmp))
+        }
+        try {
+            getSystemService(NotificationManager::class.java).notify(IMAGE_NOTIF_ID, b.build())
+        } catch (_: SecurityException) {
         }
     }
 
@@ -178,6 +241,11 @@ class SyncService : Service() {
             val ch = NotificationChannel(CHANNEL, "Clipboard sync", NotificationManager.IMPORTANCE_LOW)
             ch.description = "Shows ClipBridge connection status"
             ch.setShowBadge(false)
+            nm.createNotificationChannel(ch)
+        }
+        if (nm.getNotificationChannel(CHANNEL_IMAGES) == null) {
+            val ch = NotificationChannel(CHANNEL_IMAGES, "Received images", NotificationManager.IMPORTANCE_DEFAULT)
+            ch.description = "Preview of images and screenshots sent from your Mac"
             nm.createNotificationChannel(ch)
         }
     }

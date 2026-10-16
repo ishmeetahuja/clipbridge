@@ -18,6 +18,7 @@ import android.provider.Settings
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -28,6 +29,21 @@ private fun Context.clipboardText(): String {
     if (clip.itemCount == 0) return ""
     return clip.getItemAt(0).coerceToText(this)?.toString() ?: ""
 }
+
+/** The clipboard's image URI, if it currently holds an image. */
+private fun Context.clipboardImageUri(): Uri? {
+    val clip = getSystemService(ClipboardManager::class.java).primaryClip ?: return null
+    if (clip.itemCount == 0) return null
+    val uri = clip.getItemAt(0).uri ?: return null
+    val isImage = clip.description.hasMimeType("image/*") ||
+        (try { contentResolver.getType(uri) } catch (e: Exception) { null })?.startsWith("image/") == true
+    return if (isImage) uri else null
+}
+
+@Suppress("DEPRECATION")
+private fun Intent.streamUri(): Uri? =
+    if (Build.VERSION.SDK_INT >= 33) getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    else getParcelableExtra(Intent.EXTRA_STREAM)
 
 // ---------------------------------------------------------------- Main screen
 
@@ -71,9 +87,15 @@ class MainActivity : Activity() {
             }
         }
         findViewById<Button>(R.id.btnSend).setOnClickListener {
-            Sender.send(this, clipboardText()) { toast(it) }
+            val img = clipboardImageUri()
+            if (img != null) Sender.sendImage(this, img) { toast(it) }
+            else Sender.send(this, clipboardText()) { toast(it) }
         }
         findViewById<Button>(R.id.btnBattery).setOnClickListener { requestUnrestricted() }
+        findViewById<CheckBox>(R.id.saveImages).apply {
+            isChecked = Config.saveImages(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> Config.setSaveImages(this@MainActivity, on) }
+        }
         findViewById<Button>(R.id.btnStop).setOnClickListener {
             SyncService.stop(this)
             toast("Sync stopped")
@@ -169,10 +191,15 @@ class MainActivity : Activity() {
 class ShareActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val text = intent?.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: ""
-        Sender.send(this, text) { msg ->
+        val done: (String) -> Unit = { msg ->
             Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
             finish()
+        }
+        val image = intent?.takeIf { it.type?.startsWith("image/") == true }?.streamUri()
+        if (image != null) {
+            Sender.sendImage(this, image, done)
+        } else {
+            Sender.send(this, intent?.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: "", done)
         }
     }
 }
@@ -192,10 +219,12 @@ class SendClipboardActivity : Activity() {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus || done) return
         done = true
-        Sender.send(this, clipboardText()) { msg ->
+        val done: (String) -> Unit = { msg ->
             Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
             finish()
         }
+        val img = clipboardImageUri()
+        if (img != null) Sender.sendImage(this, img, done) else Sender.send(this, clipboardText(), done)
     }
 }
 

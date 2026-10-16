@@ -1,12 +1,20 @@
 // ClipBridge for macOS
-// Menu-bar app that watches the clipboard, keeps a local history, and syncs
-// copies to/from your Android phone through an ntfy server, end-to-end encrypted
-// (AES-256-GCM, key derived from a shared passphrase with PBKDF2-SHA256).
+// Menu-bar app that watches the clipboard (text + images) and new screenshots,
+// keeps a local history, and syncs to/from your Android phone through an ntfy
+// server, end-to-end encrypted (AES-256-GCM, key from a shared passphrase via
+// PBKDF2-SHA256).
+//
+// Wire formats (must match the Android app):
+//   text  : ntfy message body (or "clip.txt" attachment) =
+//           base64( nonce12 || AES-GCM( JSON{v,from,name,text,ts} ) || tag16 )
+//   image : ntfy attachment "clip.cbin" (raw bytes) =
+//           nonce12 || AES-GCM( u32be(len) || JSON{v:2,type:"image",from,name,ts,mime} || imageBytes ) || tag16
 
 import AppKit
 import CryptoKit
 import CommonCrypto
 import CoreImage
+import ImageIO
 
 // MARK: - Helpers
 
@@ -25,6 +33,8 @@ func preview(_ s: String, _ n: Int = 40) -> String {
 
 func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
+func sizeString(_ n: Int) -> String { ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file) }
+
 enum Paths {
     static let dir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -33,6 +43,15 @@ enum Paths {
                                                  attributes: [.posixPermissions: 0o700])
         return d
     }()
+    static let images: URL = {
+        let d = dir.appendingPathComponent("images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        return d
+    }()
+    static var received: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures/ClipBridge", isDirectory: true)
+    }
     static var config: URL { dir.appendingPathComponent("config.json") }
     static var history: URL { dir.appendingPathComponent("history.json") }
     static var launchAgent: URL {
@@ -57,6 +76,9 @@ struct Config: Codable {
     var deviceName = Host.current().localizedName ?? "Mac"
     var autoSend = true
     var paused = false
+    var sendImages = true        // images copied to the clipboard
+    var sendScreenshots = true   // new screenshot files (⌘⇧3 / ⌘⇧4 / ⌘⇧5)
+    var saveImages = true        // save received images to ~/Pictures/ClipBridge
 
     var isReady: Bool { !baseURL.isEmpty && !topic.isEmpty && !passphrase.isEmpty }
     var baseURL: String {
@@ -79,6 +101,9 @@ struct Config: Codable {
         deviceName = try c.decodeIfPresent(String.self, forKey: .deviceName) ?? d.deviceName
         autoSend = try c.decodeIfPresent(Bool.self, forKey: .autoSend) ?? true
         paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+        sendImages = try c.decodeIfPresent(Bool.self, forKey: .sendImages) ?? true
+        sendScreenshots = try c.decodeIfPresent(Bool.self, forKey: .sendScreenshots) ?? true
+        saveImages = try c.decodeIfPresent(Bool.self, forKey: .saveImages) ?? true
     }
 }
 
@@ -101,17 +126,25 @@ enum Crypto {
         return SymmetricKey(data: out)
     }
 
-    /// base64( nonce[12] || ciphertext || tag[16] )
-    static func seal(_ plain: Data, key: SymmetricKey) throws -> String {
+    /// nonce[12] || ciphertext || tag[16]
+    static func sealRaw(_ plain: Data, key: SymmetricKey) throws -> Data {
         let box = try AES.GCM.seal(plain, using: key)
         guard let combined = box.combined else { throw CocoaError(.coderInvalidValue) }
-        return combined.base64EncodedString()
+        return combined
+    }
+
+    static func openRaw(_ data: Data, key: SymmetricKey) throws -> Data {
+        let box = try AES.GCM.SealedBox(combined: data)
+        return Data(try AES.GCM.open(box, using: key))
+    }
+
+    static func seal(_ plain: Data, key: SymmetricKey) throws -> String {
+        try sealRaw(plain, key: key).base64EncodedString()
     }
 
     static func open(_ b64: String, key: SymmetricKey) throws -> Data {
         guard let d = Data(base64Encoded: trimmed(b64)) else { throw CocoaError(.coderReadCorrupt) }
-        let box = try AES.GCM.SealedBox(combined: d)
-        return try AES.GCM.open(box, using: key)
+        return try openRaw(d, key: key)
     }
 }
 
@@ -123,10 +156,121 @@ struct Payload: Codable {
     var ts: Double?   // epoch milliseconds
 }
 
+struct BlobHeader: Codable {
+    var v: Int
+    var type: String
+    var from: String
+    var name: String?
+    var ts: Double?
+    var mime: String
+}
+
+enum Blob {
+    static func seal(header: BlobHeader, body: Data, key: SymmetricKey) throws -> Data {
+        let h = try JSONEncoder().encode(header)
+        let n = h.count
+        var plain = Data([UInt8(n >> 24 & 0xFF), UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)])
+        plain.append(h)
+        plain.append(body)
+        return try Crypto.sealRaw(plain, key: key)
+    }
+
+    static func open(_ data: Data, key: SymmetricKey) throws -> (BlobHeader, Data) {
+        let p = try Crypto.openRaw(data, key: key)
+        guard p.count >= 4 else { throw CocoaError(.coderReadCorrupt) }
+        let b = [UInt8](p.prefix(4))
+        let len = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
+        guard len > 0, 4 + len <= p.count else { throw CocoaError(.coderReadCorrupt) }
+        let header = try JSONDecoder().decode(BlobHeader.self, from: p.subdata(in: 4..<(4 + len)))
+        return (header, p.subdata(in: (4 + len)..<p.count))
+    }
+}
+
 struct HistoryItem: Codable {
     var text: String
     var date: Date
     var from: String
+    var image: String?   // file name in Paths.images
+    var size: Int?
+}
+
+// MARK: - Images
+
+struct ImageClip {
+    var data: Data
+    var mime: String
+}
+
+enum ImageUtil {
+    static let maxBytes = 14_000_000
+
+    static func ext(for mime: String) -> String {
+        switch mime {
+        case "image/png": return "png"
+        case "image/jpeg", "image/jpg": return "jpg"
+        case "image/heic", "image/heif": return "heic"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/tiff": return "tiff"
+        default: return "png"
+        }
+    }
+
+    static func mime(forExt e: String) -> String {
+        switch e.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "heic", "heif": return "image/heic"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "tiff", "tif": return "image/tiff"
+        default: return "image/png"
+        }
+    }
+
+    static func uti(for mime: String) -> NSPasteboard.PasteboardType {
+        switch mime {
+        case "image/png": return .png
+        case "image/jpeg", "image/jpg": return NSPasteboard.PasteboardType("public.jpeg")
+        case "image/heic", "image/heif": return NSPasteboard.PasteboardType("public.heic")
+        case "image/gif": return NSPasteboard.PasteboardType("com.compuserve.gif")
+        case "image/webp": return NSPasteboard.PasteboardType("org.webmproject.webp")
+        default: return .tiff
+        }
+    }
+
+    static func fromPasteboard(_ pb: NSPasteboard) -> ImageClip? {
+        if let png = pb.data(forType: .png) { return ImageClip(data: png, mime: "image/png") }
+        if let jpg = pb.data(forType: NSPasteboard.PasteboardType("public.jpeg")) { return ImageClip(data: jpg, mime: "image/jpeg") }
+        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return ImageClip(data: png, mime: "image/png")
+        }
+        return nil
+    }
+
+    /// Big images are re-encoded as JPEG so they stay quick to sync.
+    static func prepare(_ img: ImageClip) -> ImageClip? {
+        var out = img
+        if out.mime == "image/tiff" || out.data.count > 5_000_000,
+           let rep = NSBitmapImageRep(data: out.data),
+           let jpg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]),
+           jpg.count < out.data.count || out.mime == "image/tiff" {
+            out = ImageClip(data: jpg, mime: "image/jpeg")
+        }
+        return out.data.count <= maxBytes ? out : nil
+    }
+
+    static func thumbnail(_ url: URL, width: CGFloat = 28) -> NSImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: 96,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        let h = min(width * 1.5, width * CGFloat(cg.height) / CGFloat(max(cg.width, 1)))
+        return NSImage(cgImage: cg, size: NSSize(width: width, height: max(h, 8)))
+    }
 }
 
 // MARK: - ntfy JSON stream subscriber
@@ -225,7 +369,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         "com.agilebits.onepassword",
     ]
     static let staleAfterMs: Double = 5 * 60 * 1000
-    static let maxBytes = 1_000_000
+    static let maxTextBytes = 1_000_000
+    static let maxImagesInHistory = 30
 
     var config = Config()
     var key: SymmetricKey?
@@ -234,11 +379,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let pb = NSPasteboard.general
     var lastChange = 0
     var lastSyncedText: String?
+    var lastImageHash: Data?
     var history: [HistoryItem] = []
+    var thumbCache: [String: NSImage] = [:]
     var stream: NtfyStream?
     var connected = false
     var lastEvent = "Starting…"
     var pollTimer: Timer?
+    var shotTimer: Timer?
+    var watchStart = Date()
+    var seenShots = Set<String>()
     var flashWork: DispatchWorkItem?
     var firstRun = false
 
@@ -252,8 +402,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setIcon(baseIcon)
 
         lastChange = pb.changeCount   // don't send whatever was already on the clipboard
+        watchStart = Date()
         pollTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self,
                                          selector: #selector(poll), userInfo: nil, repeats: true)
+        shotTimer = Timer.scheduledTimer(timeInterval: 1.0, target: self,
+                                         selector: #selector(scanScreenshots), userInfo: nil, repeats: true)
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
 
@@ -321,11 +474,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let d = try? JSONEncoder().encode(history) { writePrivate(d, to: Paths.history) }
     }
 
-    func addHistory(_ text: String, from: String) {
-        history.removeAll { $0.text == text }
-        history.insert(HistoryItem(text: text, date: Date(), from: from), at: 0)
-        if history.count > 200 { history.removeLast(history.count - 200) }
+    func deleteImageFile(_ h: HistoryItem) {
+        guard let f = h.image else { return }
+        try? FileManager.default.removeItem(at: Paths.images.appendingPathComponent(f))
+        thumbCache[f] = nil
+    }
+
+    func addHistory(_ item: HistoryItem) {
+        if item.image == nil { history.removeAll { $0.image == nil && $0.text == item.text } }
+        history.insert(item, at: 0)
+        var images = 0
+        history = history.filter { h in
+            guard h.image != nil else { return true }
+            images += 1
+            if images > Self.maxImagesInHistory { deleteImageFile(h); return false }
+            return true
+        }
+        while history.count > 200 { deleteImageFile(history.removeLast()) }
         saveHistory()
+    }
+
+    func addTextHistory(_ text: String, from: String) {
+        addHistory(HistoryItem(text: text, date: Date(), from: from, image: nil, size: nil))
+    }
+
+    func storeImage(_ img: ImageClip) -> String {
+        let name = UUID().uuidString + "." + ImageUtil.ext(for: img.mime)
+        writePrivate(img.data, to: Paths.images.appendingPathComponent(name))
+        return name
     }
 
     // MARK: Clipboard watching
@@ -336,51 +512,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastChange = cc
         let types = (pb.types ?? []).map(\.rawValue)
         if types.contains(where: { Self.skipTypes.contains($0) }) { return }
-        guard let text = pb.string(forType: .string), !text.isEmpty else { return }
-        addHistory(text, from: "This Mac")
-        if config.autoSend && !config.paused { send(text) }
+
+        if let text = pb.string(forType: .string), !text.isEmpty {
+            addTextHistory(text, from: "This Mac")
+            if config.autoSend && !config.paused { send(text) }
+            return
+        }
+        if let img = ImageUtil.fromPasteboard(pb) {
+            handleLocalImage(img, label: "Image", send: config.autoSend && config.sendImages && !config.paused)
+        }
+    }
+
+    func handleLocalImage(_ img: ImageClip, label: String, send doSend: Bool) {
+        guard let prepared = ImageUtil.prepare(img) else {
+            lastEvent = "Image too large to sync (max 14 MB)"
+            return
+        }
+        let name = storeImage(prepared)
+        addHistory(HistoryItem(text: label, date: Date(), from: "This Mac", image: name, size: prepared.data.count))
+        if doSend { sendImage(prepared, label: label) }
+    }
+
+    // MARK: Screenshot files (⌘⇧3 / ⌘⇧4 / ⌘⇧5 save to a folder, not the clipboard)
+
+    func screenshotDirectory() -> URL {
+        if let loc = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location"), !loc.isEmpty {
+            return URL(fileURLWithPath: (loc as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+    }
+
+    func isScreenCapture(_ url: URL) -> Bool {
+        if getxattr(url.path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) >= 0 { return true }
+        let n = url.lastPathComponent.lowercased()
+        return n.hasPrefix("screenshot") || n.hasPrefix("screen shot")
+    }
+
+    @objc func scanScreenshots() {
+        guard config.sendScreenshots, config.autoSend, !config.paused, config.isReady else { return }
+        let dir = screenshotDirectory()
+        let keys: [URLResourceKey] = [.creationDateKey]
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { return }
+        for url in items {
+            let ext = url.pathExtension.lowercased()
+            guard ["png", "jpg", "jpeg", "heic", "tiff"].contains(ext), !seenShots.contains(url.path) else { continue }
+            guard let created = (try? url.resourceValues(forKeys: Set(keys)))?.creationDate,
+                  created > watchStart else { continue }
+            seenShots.insert(url.path)
+            guard isScreenCapture(url) else { continue }
+            // Give the screenshot tool a moment to finish writing.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, let data = try? Data(contentsOf: url), !data.isEmpty else { return }
+                self.handleLocalImage(ImageClip(data: data, mime: ImageUtil.mime(forExt: ext)),
+                                      label: "Screenshot", send: true)
+            }
+        }
+    }
+
+    // MARK: Sending
+
+    func upload(_ body: Data, filename: String?, done: @escaping (String?) -> Void) {
+        guard let url = URL(string: "\(config.baseURL)/\(config.topic)") else { done("Bad server URL"); return }
+        var req = URLRequest(url: url)
+        if let filename {
+            req.httpMethod = "PUT"
+            req.setValue(filename, forHTTPHeaderField: "Filename")
+        } else {
+            req.httpMethod = "POST"
+        }
+        if !config.token.isEmpty { req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization") }
+        req.timeoutInterval = 120
+        URLSession.shared.uploadTask(with: req, from: body) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let errBody = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let problem: String?
+            if let err { problem = err.localizedDescription }
+            else if !(200...299).contains(code) { problem = "HTTP \(code) \(preview(errBody, 50))" }
+            else { problem = nil }
+            DispatchQueue.main.async { done(problem) }
+        }.resume()
     }
 
     func send(_ text: String, force: Bool = false) {
         guard config.isReady, let key else { lastEvent = "Not configured — open Settings"; return }
         if !force && text == lastSyncedText { return }
-        guard text.utf8.count <= Self.maxBytes else { lastEvent = "Skipped: clip too large (>1 MB)"; return }
-        guard let url = URL(string: "\(config.baseURL)/\(config.topic)") else { lastEvent = "Bad server URL"; return }
+        guard text.utf8.count <= Self.maxTextBytes else { lastEvent = "Skipped: clip too large (>1 MB)"; return }
 
         let p = Payload(v: 1, from: config.deviceId, name: config.deviceName, text: text,
                         ts: (Date().timeIntervalSince1970 * 1000).rounded())
         guard let json = try? JSONEncoder().encode(p),
               let body = try? Crypto.seal(json, key: key) else { lastEvent = "Encryption failed"; return }
         lastSyncedText = text
-
-        var req = URLRequest(url: url)
         let bytes = Data(body.utf8)
-        if bytes.count > 3800 {               // ntfy message limit is 4 KB; bigger goes as an attachment
-            req.httpMethod = "PUT"
-            req.setValue("clip.txt", forHTTPHeaderField: "Filename")
-        } else {
-            req.httpMethod = "POST"
-        }
-        if !config.token.isEmpty { req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization") }
-        req.timeoutInterval = 30
-
-        URLSession.shared.uploadTask(with: req, from: bytes) { [weak self] data, resp, err in
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            let errBody = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if let err {
-                    self.lastEvent = "Send failed: \(err.localizedDescription)"
-                    self.lastSyncedText = nil
-                } else if !(200...299).contains(code) {
-                    self.lastEvent = "Send failed: HTTP \(code) \(preview(errBody, 50))"
-                    self.lastSyncedText = nil
-                } else {
-                    self.lastEvent = "Sent: \(preview(text))"
-                    self.flash("arrow.up.doc")
-                }
+        // ntfy's message limit is 4 KB; bigger goes as an attachment
+        upload(bytes, filename: bytes.count > 3800 ? "clip.txt" : nil) { [weak self] problem in
+            guard let self else { return }
+            if let problem {
+                self.lastEvent = "Send failed: \(problem)"
+                self.lastSyncedText = nil
+            } else {
+                self.lastEvent = "Sent: \(preview(text))"
+                self.flash("arrow.up.doc")
             }
-        }.resume()
+        }
+    }
+
+    func sendImage(_ img: ImageClip, label: String) {
+        guard config.isReady, let key else { lastEvent = "Not configured — open Settings"; return }
+        let hash = Data(SHA256.hash(data: img.data))
+        if hash == lastImageHash { return }
+        let header = BlobHeader(v: 2, type: "image", from: config.deviceId, name: config.deviceName,
+                                ts: (Date().timeIntervalSince1970 * 1000).rounded(), mime: img.mime)
+        guard let blob = try? Blob.seal(header: header, body: img.data, key: key) else {
+            lastEvent = "Encryption failed"
+            return
+        }
+        lastImageHash = hash
+        lastEvent = "Sending \(label.lowercased()) (\(sizeString(img.data.count)))…"
+        flash("arrow.up.circle")
+        upload(blob, filename: "clip.cbin") { [weak self] problem in
+            guard let self else { return }
+            if let problem {
+                self.lastEvent = "Image send failed: \(problem)"
+                self.lastImageHash = nil
+            } else {
+                self.lastEvent = "Sent \(label.lowercased()) (\(sizeString(img.data.count)))"
+                self.flash("photo")
+            }
+        }
     }
 
     // MARK: Receiving
@@ -408,11 +668,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard (obj["event"] as? String) == "message" else { return }
         if let att = obj["attachment"] as? [String: Any],
            let urlStr = att["url"] as? String, let url = URL(string: urlStr) {
+            let isBlob = (att["name"] as? String ?? "").hasSuffix(".cbin")
             var req = URLRequest(url: url)
+            req.timeoutInterval = 120
             if !config.token.isEmpty { req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization") }
             URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-                guard let data, let s = String(data: data, encoding: .utf8) else { return }
-                DispatchQueue.main.async { self?.handleCipher(s) }
+                guard let data else { return }
+                DispatchQueue.main.async {
+                    if isBlob {
+                        self?.handleBlob(data)
+                    } else if let s = String(data: data, encoding: .utf8) {
+                        self?.handleCipher(s)
+                    }
+                }
             }.resume()
         } else if let msg = obj["message"] as? String {
             handleCipher(msg)
@@ -425,7 +693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let p = try? JSONDecoder().decode(Payload.self, from: plain) else { return }  // not ours / wrong passphrase
         guard p.from != config.deviceId else { return }                                      // our own echo
         let who = p.name ?? "Phone"
-        addHistory(p.text, from: who)
+        addTextHistory(p.text, from: who)
         let age = Date().timeIntervalSince1970 * 1000 - (p.ts ?? 0)
         guard !config.paused, age < Self.staleAfterMs else { return }   // keep old ones in history only
 
@@ -437,12 +705,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         flash("arrow.down.doc")
     }
 
+    func handleBlob(_ data: Data) {
+        guard let key, let opened = try? Blob.open(data, key: key) else { return }
+        let (h, body) = opened
+        guard h.from != config.deviceId, h.type == "image", !body.isEmpty else { return }
+        let who = h.name ?? "Phone"
+        let img = ImageClip(data: body, mime: h.mime)
+        let name = storeImage(img)
+        addHistory(HistoryItem(text: "Image", date: Date(), from: who, image: name, size: body.count))
+        if config.saveImages { saveToPictures(img, from: who) }
+
+        let age = Date().timeIntervalSince1970 * 1000 - (h.ts ?? 0)
+        guard !config.paused, age < Self.staleAfterMs else { return }
+        putImageOnPasteboard(img)
+        lastImageHash = Data(SHA256.hash(data: body))
+        lastEvent = "Image from \(who) (\(sizeString(body.count)))"
+        flash("photo")
+    }
+
+    func putImageOnPasteboard(_ img: ImageClip) {
+        pb.clearContents()
+        let item = NSPasteboardItem()
+        let type = ImageUtil.uti(for: img.mime)
+        item.setData(img.data, forType: type)
+        if type != .png && type != .tiff, let tiff = NSImage(data: img.data)?.tiffRepresentation {
+            item.setData(tiff, forType: .tiff)   // widest compatibility for non-PNG formats
+        }
+        pb.writeObjects([item])
+        lastChange = pb.changeCount
+    }
+
+    func saveToPictures(_ img: ImageClip, from who: String) {
+        let dir = Paths.received
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let safeWho = who.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        var url = dir.appendingPathComponent("\(safeWho) \(fmt.string(from: Date())).\(ImageUtil.ext(for: img.mime))")
+        var i = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(safeWho) \(fmt.string(from: Date())) \(i).\(ImageUtil.ext(for: img.mime))")
+            i += 1
+        }
+        try? img.data.write(to: url)
+    }
+
     // MARK: Menu
 
     var baseIcon: String { config.paused ? "pause.circle" : "doc.on.clipboard" }
 
     func setIcon(_ name: String) {
         let img = NSImage(systemSymbolName: name, accessibilityDescription: "ClipBridge")
+            ?? NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "ClipBridge")
         img?.isTemplate = true
         statusItem.button?.image = img
     }
@@ -455,7 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setIcon(self.baseIcon)
         }
         flashWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
     }
 
     func item(_ title: String, _ sel: Selector, key: String = "") -> NSMenuItem {
@@ -467,6 +781,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func disabled(_ title: String) -> NSMenuItem {
         let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         it.isEnabled = false
+        return it
+    }
+
+    func toggle(_ title: String, _ sel: Selector, _ on: Bool) -> NSMenuItem {
+        let it = item(title, sel)
+        it.state = on ? .on : .off
         return it
     }
 
@@ -489,54 +809,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fmt.dateStyle = .short
         fmt.timeStyle = .short
         for (i, h) in history.prefix(30).enumerated() {
-            let it = item(preview(h.text, 60), #selector(copyHistory(_:)))
+            let title: String
+            if h.image != nil {
+                title = "\(h.text) · \(sizeString(h.size ?? 0))" + (h.from == "This Mac" ? "" : " · from \(h.from)")
+            } else {
+                title = preview(h.text, 60)
+            }
+            let it = item(title, #selector(copyHistory(_:)))
             it.tag = i
             it.toolTip = "\(h.from) · \(fmt.string(from: h.date))"
-            if h.from != "This Mac" { it.image = NSImage(systemSymbolName: "iphone", accessibilityDescription: nil) }
+            if let f = h.image {
+                if thumbCache[f] == nil { thumbCache[f] = ImageUtil.thumbnail(Paths.images.appendingPathComponent(f)) }
+                it.image = thumbCache[f]
+            } else if h.from != "This Mac" {
+                it.image = NSImage(systemSymbolName: "iphone", accessibilityDescription: nil)
+            }
             sub.addItem(it)
         }
         sub.addItem(.separator())
+        sub.addItem(item("Open Received Images Folder", #selector(openReceived)))
         sub.addItem(item("Clear History", #selector(clearHistory)))
         recent.submenu = sub
         menu.addItem(recent)
         menu.addItem(item("Send Current Clipboard to Phone", #selector(sendNow)))
         menu.addItem(.separator())
 
-        let auto = item("Auto-send Every Copy", #selector(toggleAuto))
-        auto.state = config.autoSend ? .on : .off
-        menu.addItem(auto)
-        let pause = item("Pause Sync", #selector(togglePause))
-        pause.state = config.paused ? .on : .off
-        menu.addItem(pause)
-        let login = item("Open at Login", #selector(toggleLogin))
-        login.state = FileManager.default.fileExists(atPath: Paths.launchAgent.path) ? .on : .off
-        menu.addItem(login)
+        menu.addItem(toggle("Auto-send Every Copy", #selector(toggleAuto), config.autoSend))
+        menu.addItem(toggle("Include Images", #selector(toggleImages), config.sendImages))
+        menu.addItem(toggle("Send New Screenshots", #selector(toggleScreenshots), config.sendScreenshots))
+        menu.addItem(toggle("Save Received Images to Pictures", #selector(toggleSaveImages), config.saveImages))
+        menu.addItem(toggle("Pause Sync", #selector(togglePause), config.paused))
+        menu.addItem(toggle("Open at Login", #selector(toggleLogin),
+                            FileManager.default.fileExists(atPath: Paths.launchAgent.path)))
         menu.addItem(.separator())
         menu.addItem(item("Pair Phone…", #selector(pairPhone)))
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit ClipBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        menu.addItem(NSMenuItem(title: "Quit ClipBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     @objc func copyHistory(_ sender: NSMenuItem) {
         guard sender.tag < history.count else { return }
-        pb.clearContents()
-        pb.setString(history[sender.tag].text, forType: .string)
-        // the poller picks this up, moves it to the top and syncs it
+        let h = history[sender.tag]
+        if let f = h.image {
+            let url = Paths.images.appendingPathComponent(f)
+            guard let data = try? Data(contentsOf: url) else { return }
+            putImageOnPasteboard(ImageClip(data: data, mime: ImageUtil.mime(forExt: url.pathExtension)))
+            lastEvent = "Image copied from history"
+        } else {
+            pb.clearContents()
+            pb.setString(h.text, forType: .string)
+            // the poller picks this up, moves it to the top and syncs it
+        }
     }
 
-    @objc func clearHistory() { history.removeAll(); saveHistory() }
+    @objc func clearHistory() {
+        history.forEach(deleteImageFile)
+        history.removeAll()
+        thumbCache.removeAll()
+        saveHistory()
+    }
+
+    @objc func openReceived() {
+        try? FileManager.default.createDirectory(at: Paths.received, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(Paths.received)
+    }
 
     @objc func sendNow() {
-        guard let text = pb.string(forType: .string), !text.isEmpty else { lastEvent = "Clipboard has no text"; return }
-        send(text, force: true)
+        if let text = pb.string(forType: .string), !text.isEmpty {
+            send(text, force: true)
+        } else if let img = ImageUtil.fromPasteboard(pb), let prepared = ImageUtil.prepare(img) {
+            lastImageHash = nil
+            sendImage(prepared, label: "Image")
+        } else {
+            lastEvent = "Clipboard is empty"
+        }
     }
 
     @objc func toggleAuto() { config.autoSend.toggle(); saveConfig() }
+    @objc func toggleImages() { config.sendImages.toggle(); saveConfig() }
+    @objc func toggleSaveImages() { config.saveImages.toggle(); saveConfig() }
+
+    @objc func toggleScreenshots() {
+        config.sendScreenshots.toggle()
+        watchStart = Date()   // don't send screenshots taken while it was off
+        saveConfig()
+    }
 
     @objc func togglePause() {
         config.paused.toggle()
+        watchStart = Date()
         saveConfig()
         setIcon(baseIcon)
     }
@@ -622,6 +984,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         saveConfig()
         deriveKey()
         lastSyncedText = nil
+        lastImageHash = nil
         restartStream()
         lastEvent = config.isReady ? "Settings saved" : "Not configured"
     }

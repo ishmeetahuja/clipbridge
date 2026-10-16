@@ -1,6 +1,7 @@
 package ca.ishmeet.clipbridge
 
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -9,6 +10,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.UUID
 import javax.crypto.Cipher
@@ -70,6 +72,9 @@ object Config {
             .commit()
     }
 
+    fun saveImages(ctx: Context) = prefs(ctx).getBoolean("saveImages", true)
+    fun setSaveImages(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean("saveImages", on).apply()
+
     fun isEnabled(ctx: Context) = prefs(ctx).getBoolean("enabled", false)
     fun setEnabled(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean("enabled", on).apply()
 }
@@ -105,21 +110,26 @@ object Crypto {
         return out
     }
 
-    /** base64( nonce[12] || ciphertext || tag[16] ) — same layout as CryptoKit's AES.GCM combined */
-    fun seal(plain: ByteArray, key: ByteArray): String {
+    /** nonce[12] || ciphertext || tag[16] — same layout as CryptoKit's AES.GCM combined */
+    fun sealRaw(plain: ByteArray, key: ByteArray): ByteArray {
         val nonce = ByteArray(12).also { rng.nextBytes(it) }
         val c = Cipher.getInstance("AES/GCM/NoPadding")
         c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
-        return Base64.encodeToString(nonce + c.doFinal(plain), Base64.NO_WRAP)
+        return nonce + c.doFinal(plain)
     }
 
-    fun open(b64: String, key: ByteArray): ByteArray {
-        val d = Base64.decode(b64.trim(), Base64.DEFAULT)
-        require(d.size > 28) { "too short" }
+    fun openRaw(d: ByteArray, key: ByteArray): ByteArray {
+        require(d.size >= 28) { "too short" }
         val c = Cipher.getInstance("AES/GCM/NoPadding")
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, d, 0, 12))
         return c.doFinal(d, 12, d.size - 12)
     }
+
+    fun seal(plain: ByteArray, key: ByteArray): String =
+        Base64.encodeToString(sealRaw(plain, key), Base64.NO_WRAP)
+
+    fun open(b64: String, key: ByteArray): ByteArray =
+        openRaw(Base64.decode(b64.trim(), Base64.DEFAULT), key)
 }
 
 // ---------------------------------------------------------------- Payload
@@ -146,6 +156,43 @@ object Payload {
     }
 }
 
+// ---------------------------------------------------------------- Binary blobs (images)
+// sealRaw( u32be(headerLen) || header JSON || image bytes ), sent as an ntfy attachment "clip.cbin"
+
+class ImageBlob(val from: String, val name: String, val ts: Long, val mime: String, val data: ByteArray)
+
+object BlobCodec {
+    const val FILENAME = "clip.cbin"
+
+    fun encodeImage(cfg: Cfg, mime: String, data: ByteArray): ByteArray {
+        val h = JSONObject()
+            .put("v", 2)
+            .put("type", "image")
+            .put("from", cfg.deviceId)
+            .put("name", cfg.deviceName)
+            .put("ts", System.currentTimeMillis())
+            .put("mime", mime)
+            .toString().toByteArray(Charsets.UTF_8)
+        val plain = ByteArray(4 + h.size + data.size)
+        ByteBuffer.wrap(plain).putInt(h.size).put(h).put(data)
+        return Crypto.sealRaw(plain, cfg.key!!)
+    }
+
+    fun decode(cfg: Cfg, bytes: ByteArray): ImageBlob? = try {
+        val p = Crypto.openRaw(bytes, cfg.key!!)
+        val len = ByteBuffer.wrap(p, 0, 4).int
+        require(len > 0 && 4 + len <= p.size)
+        val h = JSONObject(String(p, 4, len, Charsets.UTF_8))
+        if (h.optString("type") != "image") null
+        else ImageBlob(
+            h.getString("from"), h.optString("name", "Mac"), h.optLong("ts", 0L),
+            h.optString("mime", "image/png"), p.copyOfRange(4 + len, p.size)
+        )
+    } catch (e: Exception) {
+        null
+    }
+}
+
 // ---------------------------------------------------------------- ntfy HTTP
 
 object Ntfy {
@@ -155,14 +202,19 @@ object Ntfy {
 
     fun publish(cfg: Cfg, body: String) {
         val bytes = body.toByteArray(Charsets.UTF_8)
+        // ntfy's message limit is 4 KB; bigger goes as an attachment
+        publishBytes(cfg, bytes, if (bytes.size > 3800) "clip.txt" else null)
+    }
+
+    fun publishBytes(cfg: Cfg, bytes: ByteArray, filename: String?) {
         val c = URL("${cfg.base}/${cfg.topic}").openConnection() as HttpURLConnection
         try {
             c.connectTimeout = 15_000
-            c.readTimeout = 30_000
+            c.readTimeout = 120_000
             c.doOutput = true
-            if (bytes.size > 3800) {           // ntfy's message limit is 4 KB; bigger goes as an attachment
+            if (filename != null) {
                 c.requestMethod = "PUT"
-                c.setRequestProperty("Filename", "clip.txt")
+                c.setRequestProperty("Filename", filename)
             } else {
                 c.requestMethod = "POST"
             }
@@ -179,14 +231,16 @@ object Ntfy {
         }
     }
 
-    fun download(cfg: Cfg, url: String): String {
+    fun download(cfg: Cfg, url: String): String = String(downloadBytes(cfg, url), Charsets.UTF_8)
+
+    fun downloadBytes(cfg: Cfg, url: String): ByteArray {
         val c = URL(url).openConnection() as HttpURLConnection
         try {
             c.connectTimeout = 15_000
-            c.readTimeout = 30_000
+            c.readTimeout = 120_000
             auth(c, cfg)
             if (c.responseCode != 200) throw IOException("HTTP ${c.responseCode}")
-            return c.inputStream.bufferedReader().use { it.readText() }
+            return c.inputStream.use { it.readBytes() }
         } finally {
             c.disconnect()
         }
@@ -211,6 +265,37 @@ object Sender {
                         Ntfy.publish(cfg, Payload.encode(cfg, text))
                         SyncService.status = "Sent: ${preview(text)}"
                         "Sent to Mac ✓"
+                    }
+                }
+            } catch (e: Exception) {
+                "Send failed: ${e.message}"
+            }
+            main.post { done(msg) }
+        }.start()
+    }
+
+    fun sendImage(ctx: Context, uri: Uri, done: (String) -> Unit) {
+        val app = ctx.applicationContext
+        // Read on the caller's side of the permission grant, then upload in the background.
+        Thread {
+            val msg = try {
+                val cfg = Config.load(app)
+                if (!cfg.ready) {
+                    "ClipBridge isn't paired yet — open the app"
+                } else {
+                    var mime = app.contentResolver.getType(uri)?.takeIf { it.startsWith("image/") } ?: "image/png"
+                    var data = app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw IOException("Couldn't read the image")
+                    if (data.size > Images.MAX_BYTES) {
+                        data = Images.toJpeg(data) ?: data
+                        mime = "image/jpeg"
+                    }
+                    if (data.size > Images.MAX_BYTES) {
+                        "Image too large (max 14 MB)"
+                    } else {
+                        Ntfy.publishBytes(cfg, BlobCodec.encodeImage(cfg, mime, data), BlobCodec.FILENAME)
+                        SyncService.status = "Sent image (${data.size / 1024} KB)"
+                        "Image sent to Mac ✓"
                     }
                 }
             } catch (e: Exception) {

@@ -11,7 +11,7 @@ Mac (menu-bar app) ──encrypted──▶  ntfy server  ──encrypted──�
 - **Transport:** [ntfy](https://ntfy.sh). It uses the free public server by default, and you can self-host it later (see `server/`).
 - **Encryption:** AES-256-GCM, with the key derived from a shared passphrase using PBKDF2-SHA256 (200k rounds). The server only ever sees ciphertext.
 - **Passwords:** the Mac skips anything your password manager marks as concealed (1Password, Bitwarden and others).
-- **Content:** text only, up to 1 MB per clip.
+- **Content:** text (up to 1 MB) and images (up to 14 MB). New screenshots on the Mac are sent automatically.
 
 ---
 
@@ -76,13 +76,20 @@ The notification should say **Connected · ntfy.sh · waiting for clips**.
 | You want to… | Do this |
 |---|---|
 | Mac → phone | Just copy (⌘C) on the Mac. Paste on the phone a moment later. |
+| Screenshot → phone | Take a screenshot (⌘⇧3 / ⌘⇧4 / ⌘⇧5, or ⌘⌃⇧4 to copy it). The phone shows a preview notification, the image is on its clipboard, and it's saved to **Pictures/ClipBridge**. |
+| Image → phone | Copy any image on the Mac (e.g. right-click → Copy Image in a browser). |
+| Image or screenshot → Mac | On the phone, tap **Share** on the screenshot preview (or any photo) → **Send to Mac**. Or copy an image and tap the tile. On the Mac it lands on the clipboard (⌘V) and in **~/Pictures/ClipBridge**. |
 | Phone → Mac | Select text → **Share → Send to Mac**, *or* copy it and tap the **Send to Mac** tile, *or* tap **Send clipboard to Mac** in the ClipBridge notification. Then ⌘V on the Mac. |
 | Find something you copied earlier | Menu-bar icon → **Recent Clips** → click an item to copy it again. A 📱 icon means it came from the phone. |
-| Temporarily stop syncing | Menu-bar icon → **Pause Sync**, or turn off **Auto-send Every Copy** to only send manually. |
+| Temporarily stop syncing | Menu-bar icon → **Pause Sync**, or turn off **Auto-send Every Copy** to only send manually. **Include Images** and **Send New Screenshots** switch image sync on and off. |
 
 The menu-bar icon briefly shows ↑ when a clip is sent and ↓ when one arrives.
 
 ## Troubleshooting
+
+- **Screenshots aren't sent.** The first time, macOS asks to let ClipBridge access your **Desktop** folder (or wherever screenshots are saved). Choose **Allow**. Also make sure **Send New Screenshots** is ticked in the menu.
+- **Screenshots arrive a few seconds late.** macOS only saves the file after the floating thumbnail disappears. Swipe the thumbnail away to send it right away, or turn the thumbnail off with ⌘⇧5 → Options → Show Floating Thumbnail.
+- **Images: the public ntfy.sh server** allows attachments up to 15 MB and roughly 100 MB of storage per visitor, kept for a few hours. That's plenty for screenshots. Self-host for heavier use.
 
 - **The Mac menu says "Connecting…" forever.** Check your internet connection and the Server URL under Settings.
 - **The phone shows "Reconnecting… (HTTP 403/401)".** The server needs an access token. Put the same token in both apps.
