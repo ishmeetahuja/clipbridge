@@ -144,6 +144,7 @@ object Payload {
             .put("name", cfg.deviceName)
             .put("text", text)
             .put("ts", System.currentTimeMillis())
+            .put("platform", "android")
         return Crypto.seal(o.toString().toByteArray(Charsets.UTF_8), cfg.key!!)
     }
 
@@ -172,6 +173,7 @@ object BlobCodec {
             .put("name", cfg.deviceName)
             .put("ts", System.currentTimeMillis())
             .put("mime", mime)
+            .put("platform", "android")
             .toString().toByteArray(Charsets.UTF_8)
         val plain = ByteArray(4 + h.size + data.size)
         ByteBuffer.wrap(plain).putInt(h.size).put(h).put(data)

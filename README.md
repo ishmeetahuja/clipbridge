@@ -77,7 +77,7 @@ The notification should say **Connected · ntfy.sh · waiting for clips**.
 |---|---|
 | Mac → phone | Just copy (⌘C) on the Mac. Paste on the phone a moment later. |
 | Screenshot → phone | Take a screenshot (⌘⇧3 / ⌘⇧4 / ⌘⇧5, or ⌘⌃⇧4 to copy it). The phone shows a preview notification, the image is on its clipboard, and it's saved to **Pictures/ClipBridge**. |
-| Image → phone | Copy any image on the Mac (e.g. right-click → Copy Image in a browser). |
+| Image → phone | Copy any image on the Mac: an image file in Finder (⌘C, up to 10 at once), or right-click → Copy Image in a browser. HEIC photos are converted to JPEG. |
 | Image or screenshot → Mac | On the phone, tap **Share** on the screenshot preview (or any photo) → **Send to Mac**. Or copy an image and tap the tile. On the Mac it lands on the clipboard (⌘V) and in **~/Pictures/ClipBridge**. |
 | Phone → Mac | Select text → **Share → Send to Mac**, *or* copy it and tap the **Send to Mac** tile, *or* tap **Send clipboard to Mac** in the ClipBridge notification. Then ⌘V on the Mac. |
 | Find something you copied earlier | Menu-bar icon → **Recent Clips** → click an item to copy it again. A 📱 icon means it came from the phone. |
@@ -97,6 +97,15 @@ The menu-bar icon briefly shows ↑ when a clip is sent and ↓ when one arrives
 - **Nothing arrives at all.** The topic and passphrase must match *exactly* on both devices. Re-pair with the QR code to be sure.
 - **Long clips (> ~2.8 KB) don't sync on a self-hosted server.** Turn on attachments (`NTFY_ATTACHMENT_CACHE_DIR`, already set in `server/docker-compose.yml`).
 - **Clips sent while a device was asleep didn't land on its clipboard.** By design, a clip older than 5 minutes is added to the Mac's history but not put on the clipboard, so a stale clip never overwrites what you have now.
+
+## More than one Mac (e.g. work + home)
+
+All devices that share the same server, topic and passphrase sync together.
+1. On the Mac that's already paired: menu → **Pair Phone…** → **Copy Pairing Link**. Send it to yourself (Notes, email, Messages).
+2. On the other Mac, install ClipBridge, then either **click the link** or use menu → **Join Existing Pairing…** and paste it.
+
+Each device keeps its own ID, so don't copy `config.json` between Macs; use the link instead.
+The Macs also sync with **each other**. To keep a Mac phone-only, untick **Receive from Other Macs** on that Mac.
 
 ## Self-hosting ntfy (optional)
 

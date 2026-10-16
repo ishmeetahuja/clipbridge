@@ -15,6 +15,7 @@ import CryptoKit
 import CommonCrypto
 import CoreImage
 import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Helpers
 
@@ -79,6 +80,7 @@ struct Config: Codable {
     var sendImages = true        // images copied to the clipboard
     var sendScreenshots = true   // new screenshot files (⌘⇧3 / ⌘⇧4 / ⌘⇧5)
     var saveImages = true        // save received images to ~/Pictures/ClipBridge
+    var receiveFromMacs = true   // apply clips sent by other Macs in the same pairing
 
     var isReady: Bool { !baseURL.isEmpty && !topic.isEmpty && !passphrase.isEmpty }
     var baseURL: String {
@@ -104,6 +106,7 @@ struct Config: Codable {
         sendImages = try c.decodeIfPresent(Bool.self, forKey: .sendImages) ?? true
         sendScreenshots = try c.decodeIfPresent(Bool.self, forKey: .sendScreenshots) ?? true
         saveImages = try c.decodeIfPresent(Bool.self, forKey: .saveImages) ?? true
+        receiveFromMacs = try c.decodeIfPresent(Bool.self, forKey: .receiveFromMacs) ?? true
     }
 }
 
@@ -154,6 +157,7 @@ struct Payload: Codable {
     var name: String?
     var text: String
     var ts: Double?   // epoch milliseconds
+    var platform: String?   // "mac" or "android" (missing on older phone builds)
 }
 
 struct BlobHeader: Codable {
@@ -163,6 +167,7 @@ struct BlobHeader: Codable {
     var name: String?
     var ts: Double?
     var mime: String
+    var platform: String?
 }
 
 enum Blob {
@@ -249,15 +254,36 @@ enum ImageUtil {
     }
 
     /// Big images are re-encoded as JPEG so they stay quick to sync.
+    static let phoneFriendly: Set<String> = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+
     static func prepare(_ img: ImageClip) -> ImageClip? {
         var out = img
-        if out.mime == "image/tiff" || out.data.count > 5_000_000,
+        let mustConvert = !phoneFriendly.contains(out.mime)          // HEIC, TIFF, BMP…
+        let shouldShrink = out.data.count > 5_000_000 && out.mime != "image/gif"
+        if mustConvert || shouldShrink,
            let rep = NSBitmapImageRep(data: out.data),
            let jpg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]),
-           jpg.count < out.data.count || out.mime == "image/tiff" {
+           mustConvert || jpg.count < out.data.count {
             out = ImageClip(data: jpg, mime: "image/jpeg")
         }
         return out.data.count <= maxBytes ? out : nil
+    }
+
+    /// Files copied in Finder (the clipboard holds their URLs plus the file name as text).
+    static func filesFromPasteboard(_ pb: NSPasteboard) -> [URL]? {
+        guard let urls = pb.readObjects(forClasses: [NSURL.self],
+                                        options: [.urlReadingFileURLsOnly: true]) as? [URL],
+              !urls.isEmpty else { return nil }
+        return urls
+    }
+
+    static func isImageFile(_ url: URL) -> Bool {
+        guard let t = UTType(filenameExtension: url.pathExtension) else { return false }
+        return t.conforms(to: .image) && !t.conforms(to: .pdf)
+    }
+
+    static func mime(forFile url: URL) -> String {
+        UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? mime(forExt: url.pathExtension)
     }
 
     static func thumbnail(_ url: URL, width: CGFloat = 28) -> NSImage? {
@@ -513,6 +539,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let types = (pb.types ?? []).map(\.rawValue)
         if types.contains(where: { Self.skipTypes.contains($0) }) { return }
 
+        // Files copied in Finder: send the images themselves, never just their names.
+        if let files = ImageUtil.filesFromPasteboard(pb) {
+            let images = files.filter(ImageUtil.isImageFile).prefix(10)
+            let doSend = config.autoSend && config.sendImages && !config.paused
+            for url in images {
+                guard let data = try? Data(contentsOf: url), !data.isEmpty else { continue }
+                lastImageHash = nil   // allow several in a row
+                handleLocalImage(ImageClip(data: data, mime: ImageUtil.mime(forFile: url)),
+                                 label: url.deletingPathExtension().lastPathComponent, send: doSend)
+            }
+            if images.isEmpty { lastEvent = "Copied file(s) — only images are synced" }
+            return
+        }
+
         if let text = pb.string(forType: .string), !text.isEmpty {
             addTextHistory(text, from: "This Mac")
             if config.autoSend && !config.paused { send(text) }
@@ -600,7 +640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard text.utf8.count <= Self.maxTextBytes else { lastEvent = "Skipped: clip too large (>1 MB)"; return }
 
         let p = Payload(v: 1, from: config.deviceId, name: config.deviceName, text: text,
-                        ts: (Date().timeIntervalSince1970 * 1000).rounded())
+                        ts: (Date().timeIntervalSince1970 * 1000).rounded(), platform: "mac")
         guard let json = try? JSONEncoder().encode(p),
               let body = try? Crypto.seal(json, key: key) else { lastEvent = "Encryption failed"; return }
         lastSyncedText = text
@@ -623,7 +663,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hash = Data(SHA256.hash(data: img.data))
         if hash == lastImageHash { return }
         let header = BlobHeader(v: 2, type: "image", from: config.deviceId, name: config.deviceName,
-                                ts: (Date().timeIntervalSince1970 * 1000).rounded(), mime: img.mime)
+                                ts: (Date().timeIntervalSince1970 * 1000).rounded(), mime: img.mime,
+                                platform: "mac")
         guard let blob = try? Blob.seal(header: header, body: img.data, key: key) else {
             lastEvent = "Encryption failed"
             return
@@ -692,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let plain = try? Crypto.open(s, key: key),
               let p = try? JSONDecoder().decode(Payload.self, from: plain) else { return }  // not ours / wrong passphrase
         guard p.from != config.deviceId else { return }                                      // our own echo
+        if p.platform == "mac" && !config.receiveFromMacs { return }
         let who = p.name ?? "Phone"
         addTextHistory(p.text, from: who)
         let age = Date().timeIntervalSince1970 * 1000 - (p.ts ?? 0)
@@ -709,6 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let key, let opened = try? Blob.open(data, key: key) else { return }
         let (h, body) = opened
         guard h.from != config.deviceId, h.type == "image", !body.isEmpty else { return }
+        if h.platform == "mac" && !config.receiveFromMacs { return }
         let who = h.name ?? "Phone"
         let img = ImageClip(data: body, mime: h.mime)
         let name = storeImage(img)
@@ -838,11 +881,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(toggle("Include Images", #selector(toggleImages), config.sendImages))
         menu.addItem(toggle("Send New Screenshots", #selector(toggleScreenshots), config.sendScreenshots))
         menu.addItem(toggle("Save Received Images to Pictures", #selector(toggleSaveImages), config.saveImages))
+        menu.addItem(toggle("Receive from Other Macs", #selector(toggleMacs), config.receiveFromMacs))
         menu.addItem(toggle("Pause Sync", #selector(togglePause), config.paused))
         menu.addItem(toggle("Open at Login", #selector(toggleLogin),
                             FileManager.default.fileExists(atPath: Paths.launchAgent.path)))
         menu.addItem(.separator())
         menu.addItem(item("Pair Phone…", #selector(pairPhone)))
+        menu.addItem(item("Join Existing Pairing…", #selector(joinPairing)))
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit ClipBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -889,6 +934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAuto() { config.autoSend.toggle(); saveConfig() }
     @objc func toggleImages() { config.sendImages.toggle(); saveConfig() }
     @objc func toggleSaveImages() { config.saveImages.toggle(); saveConfig() }
+    @objc func toggleMacs() { config.receiveFromMacs.toggle(); saveConfig() }
 
     @objc func toggleScreenshots() {
         config.sendScreenshots.toggle()
@@ -1034,12 +1080,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         alert.addButton(withTitle: "Done")
         alert.addButton(withTitle: "Copy Pairing Link")
-        if alert.runModal() == .alertSecondButtonReturn {
+        alert.addButton(withTitle: "Join Existing Pairing…")
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
             pb.clearContents()
             pb.setString(uri, forType: .string)
             lastChange = pb.changeCount   // don't sync or log the secret link
             lastEvent = "Pairing link copied"
+        case .alertThirdButtonReturn:
+            joinPairing()
+        default:
+            break
         }
+    }
+
+    // MARK: Joining an existing pairing (e.g. a second Mac)
+
+    struct PairingInfo {
+        var server: String
+        var topic: String
+        var pass: String
+        var token: String
+    }
+
+    func parsePairing(_ s: String) -> PairingInfo? {
+        guard let c = URLComponents(string: trimmed(s)), c.scheme == "clipbridge" else { return nil }
+        func q(_ n: String) -> String { trimmed(c.queryItems?.first { $0.name == n }?.value ?? "") }
+        let info = PairingInfo(server: q("server"), topic: q("topic"), pass: q("pass"), token: q("token"))
+        return info.server.isEmpty || info.topic.isEmpty || info.pass.isEmpty ? nil : info
+    }
+
+    @objc func joinPairing() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Join an existing ClipBridge pairing"
+        alert.informativeText = "On the device that's already set up (e.g. your other Mac): ClipBridge menu → Pair Phone… → Copy Pairing Link. Get that link to this Mac (Notes, email, Messages) and paste it below — or just click the link and ClipBridge opens it."
+        let f = NSTextField(string: "")
+        f.placeholderString = "clipbridge://pair?server=…&topic=…&pass=…"
+        f.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
+        if let s = pb.string(forType: .string), parsePairing(s) != nil { f.stringValue = trimmed(s) }
+        alert.accessoryView = f
+        alert.addButton(withTitle: "Join")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = f
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let info = parsePairing(f.stringValue) else {
+            let bad = NSAlert()
+            bad.messageText = "That isn't a ClipBridge pairing link"
+            bad.informativeText = "It should start with clipbridge://pair?"
+            bad.runModal()
+            return
+        }
+        applyPairing(info)
+    }
+
+    func applyPairing(_ info: PairingInfo) {
+        config.server = info.server
+        config.topic = info.topic
+        config.passphrase = info.pass
+        config.token = info.token
+        applyConfig()   // keeps this Mac's own device ID, so devices don't ignore each other
+        lastEvent = "Joined pairing ✓"
+        flash("checkmark.circle")
+    }
+
+    // clipbridge://pair?… links clicked anywhere on this Mac
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first, let info = parsePairing(url.absoluteString) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Join this ClipBridge pairing?"
+        alert.informativeText = "This Mac will sync with every device using topic “\(info.topic)” on \(info.server)."
+        alert.addButton(withTitle: "Join")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { applyPairing(info) }
     }
 }
 
